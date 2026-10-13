@@ -131,29 +131,38 @@ mod once_cell_lite {
         }
     }
 
-    /// Stable extraction directory for the bundled model.
-    ///
-    /// Deliberately NOT keyed on `process::id()`. A PID-keyed path is
-    /// created once per process and never removed, so it leaks a full
-    /// copy of the model (~8 MB) per process start — unbounded on any
-    /// host whose `TMPDIR` is persistent (long-lived agent or server
-    /// processes). Keying on the model's identity means every process on
-    /// the host shares one directory, so the extraction is written once
-    /// instead of once per process.
+    /// Preferred extraction directory for the bundled model.
     ///
     /// Mirrors the downloaded embedders, which cache under
-    /// `<cache_dir>/yantrikdb/models/<name>-<version>`. The bundled model
-    /// has no release tag, so its content fingerprint — the same digest
-    /// `bundled_embedder_fingerprint()` already exposes as the model's
-    /// provable identity — plays that role. A bundle swap therefore lands
-    /// in a fresh directory instead of racing readers in the old one.
+    /// `<cache_dir>/yantrikdb/models/<name>-<version>`; see [`model_root`]
+    /// and [`dir_name`].
     fn extraction_dir() -> std::path::PathBuf {
+        model_root().join(dir_name())
+    }
+
+    /// Name of the extraction directory: `<model-name>-<fingerprint>`.
+    ///
+    /// Deliberately NOT keyed on `process::id()`. A PID-keyed name is
+    /// created once per process and never removed, so it leaks a full copy
+    /// of the model (~8 MB) per process start — unbounded on any host
+    /// whose `TMPDIR` is persistent (long-lived agent or server
+    /// processes). Keying on the model's identity means every process on
+    /// the host shares one directory, so the extraction is written once
+    /// instead of once per process, and a bundle swap lands in a fresh
+    /// directory rather than racing readers in the old one.
+    ///
+    /// The bundled model has no release tag, so its content fingerprint —
+    /// the digest `bundled_embedder_fingerprint()` already exposes as the
+    /// model's provable identity — plays that role. Shared by the
+    /// cache-dir path and the temp-dir fallback so both land on the same
+    /// name.
+    fn dir_name() -> String {
         // `bundled_embedder_fingerprint()` is `"blake3:<hex>"`; strip the
         // scheme prefix because `:` is not a legal filename character on
         // Windows.
         let fp = super::bundled_embedder_fingerprint();
         let fp = fp.strip_prefix("blake3:").unwrap_or(fp);
-        model_root().join(format!("{}-{fp}", super::BUNDLED_EMBEDDER_NAME))
+        format!("{}-{fp}", super::BUNDLED_EMBEDDER_NAME)
     }
 
     /// `<cache_dir>/yantrikdb/models` when a platform cache dir is
@@ -174,14 +183,11 @@ mod once_cell_lite {
         std::env::temp_dir().join("yantrikdb")
     }
 
-    /// Extract the four bundled files into [`extraction_dir`] and load.
-    /// Errors are returned as owned strings so the OnceLock's stored
-    /// value is `'static` (no borrows escape the closure).
-    fn init_model() -> Result<StaticModel, String> {
+    /// Write the four bundled files into `dir`, reusing any file that is
+    /// already byte-identical. Errors are returned as owned strings.
+    fn extract_into(dir: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
-        let temp = extraction_dir();
-        std::fs::create_dir_all(&temp)
-            .map_err(|e| format!("create temp dir {}: {e}", temp.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
         for (name, bytes) in [
             ("model.safetensors", super::POTION_2M_MODEL),
@@ -189,7 +195,7 @@ mod once_cell_lite {
             ("config.json", super::POTION_2M_CONFIG),
             ("modules.json", super::POTION_2M_MODULES),
         ] {
-            let path = temp.join(name);
+            let path = dir.join(name);
             // Reuse only when the on-disk copy is byte-identical to the
             // baked-in one. A length-only check would accept a
             // same-length corruption, and the directory is now shared
@@ -216,7 +222,7 @@ mod once_cell_lite {
             // by every process on the host now, so concurrent writers
             // must not collide on the partial file. Only the directory
             // lost its PID.
-            let staging = temp.join(format!("{name}.{}.partial", std::process::id()));
+            let staging = dir.join(format!("{name}.{}.partial", std::process::id()));
             {
                 let mut f = std::fs::File::create(&staging)
                     .map_err(|e| format!("create {}: {e}", staging.display()))?;
@@ -228,8 +234,40 @@ mod once_cell_lite {
             std::fs::rename(&staging, &path)
                 .map_err(|e| format!("publish {}: {e}", path.display()))?;
         }
+        Ok(())
+    }
 
-        StaticModel::from_pretrained(&temp, None, None, None)
+    /// Extract the bundled files and load the model.
+    ///
+    /// The bundled model is the default path and has to work with no
+    /// network and no setup, so a cache dir that merely *resolves* is not
+    /// enough: `dirs::cache_dir()` still returns `Some` where it cannot be
+    /// written — systemd units with `ProtectHome=read-only`, containers
+    /// with a read-only root and a tmpfs `/tmp`, service users with
+    /// `HOME=/nonexistent`. A directory that exists but is read-only fails
+    /// at the write, not at `create_dir_all`, so the fallback covers the
+    /// whole extract step rather than just the directory creation. It is
+    /// keyed on the same fingerprint, so it does not reintroduce the leak.
+    ///
+    /// Errors are returned as owned strings so the OnceLock's stored value
+    /// is `'static` (no borrows escape the closure).
+    fn init_model() -> Result<StaticModel, String> {
+        let primary = extraction_dir();
+        let dir = match extract_into(&primary) {
+            Ok(()) => primary,
+            Err(e) => {
+                let fallback = std::env::temp_dir().join("yantrikdb").join(dir_name());
+                extract_into(&fallback).map_err(|e2| {
+                    format!(
+                        "{e}; temp-dir fallback {} also failed: {e2}",
+                        fallback.display()
+                    )
+                })?;
+                fallback
+            }
+        };
+
+        StaticModel::from_pretrained(&dir, None, None, None)
             .map_err(|e| format!("model2vec_rs load: {e}"))
     }
 
@@ -243,14 +281,17 @@ mod once_cell_lite {
         #[test]
         fn extraction_dir_is_stable_not_pid_keyed() {
             let dir = super::extraction_dir();
-            let s = dir.to_string_lossy().into_owned();
-            assert!(
-                !s.contains(&std::process::id().to_string()),
-                "extraction dir must not be keyed on the process id: {s}"
-            );
-            assert!(
-                s.contains(super::super::BUNDLED_EMBEDDER_NAME),
-                "extraction dir should be keyed on the model identity: {s}"
+            // Assert the exact directory name, not a substring: the model
+            // name and the 64-hex fingerprint contain digits, so a
+            // `!path.contains(pid)` check would false-fail whenever the
+            // PID's digits happen to occur inside them (routinely the case
+            // in containers, where PIDs are small).
+            let fp = super::super::bundled_embedder_fingerprint();
+            let fp = fp.strip_prefix("blake3:").unwrap_or(fp);
+            assert_eq!(
+                dir.file_name().unwrap().to_string_lossy(),
+                format!("{}-{fp}", super::super::BUNDLED_EMBEDDER_NAME),
+                "extraction dir must be keyed on the model identity, not the process id"
             );
             // With `dirs` compiled in, the bundled model caches under the
             // platform cache dir — the same scheme the downloaded
@@ -259,7 +300,8 @@ mod once_cell_lite {
             if let Some(cache) = dirs::cache_dir() {
                 assert!(
                     dir.starts_with(cache.join("yantrikdb").join("models")),
-                    "bundled model should cache under the platform cache dir: {s}"
+                    "bundled model should cache under the platform cache dir: {}",
+                    dir.display()
                 );
             }
             // Stable: two calls agree, so a second process lands in the
