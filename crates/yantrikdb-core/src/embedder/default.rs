@@ -117,8 +117,8 @@ mod once_cell_lite {
         }
 
         /// Get-or-init the model. Extracts the bundled bytes to a
-        /// process-local temp directory on first call, then loads via
-        /// `model2vec_rs::StaticModel::from_pretrained`.
+        /// shared, content-addressed directory on first call, then loads
+        /// via `model2vec_rs::StaticModel::from_pretrained`.
         ///
         /// Every instance shares one initialization, so the extraction
         /// runs exactly once per process no matter how many embedders
@@ -131,16 +131,55 @@ mod once_cell_lite {
         }
     }
 
-    /// Extract the four bundled files into a temp dir and load. Errors
-    /// are returned as owned strings so the OnceLock's stored value is
-    /// `'static` (no borrows escape the closure).
+    /// Stable extraction directory for the bundled model.
+    ///
+    /// Deliberately NOT keyed on `process::id()`. A PID-keyed path is
+    /// created once per process and never removed, so it leaks a full
+    /// copy of the model (~8 MB) per process start — unbounded on any
+    /// host whose `TMPDIR` is persistent (long-lived agent or server
+    /// processes). Keying on the model's identity means every process on
+    /// the host shares one directory, so the extraction is written once
+    /// instead of once per process.
+    ///
+    /// Mirrors the downloaded embedders, which cache under
+    /// `<cache_dir>/yantrikdb/models/<name>-<version>`. The bundled model
+    /// has no release tag, so its content fingerprint — the same digest
+    /// `bundled_embedder_fingerprint()` already exposes as the model's
+    /// provable identity — plays that role. A bundle swap therefore lands
+    /// in a fresh directory instead of racing readers in the old one.
+    fn extraction_dir() -> std::path::PathBuf {
+        // `bundled_embedder_fingerprint()` is `"blake3:<hex>"`; strip the
+        // scheme prefix because `:` is not a legal filename character on
+        // Windows.
+        let fp = super::bundled_embedder_fingerprint();
+        let fp = fp.strip_prefix("blake3:").unwrap_or(fp);
+        model_root().join(format!("{}-{fp}", super::BUNDLED_EMBEDDER_NAME))
+    }
+
+    /// `<cache_dir>/yantrikdb/models` when a platform cache dir is
+    /// available, else `$TMPDIR/yantrikdb`.
+    ///
+    /// `dirs` is only compiled in behind `embedder-download`, so a slim
+    /// `bundled-embedder`-only build falls back to the temp dir.
+    #[cfg(feature = "embedder-download")]
+    fn model_root() -> std::path::PathBuf {
+        match dirs::cache_dir() {
+            Some(cache) => cache.join("yantrikdb").join("models"),
+            None => std::env::temp_dir().join("yantrikdb"),
+        }
+    }
+
+    #[cfg(not(feature = "embedder-download"))]
+    fn model_root() -> std::path::PathBuf {
+        std::env::temp_dir().join("yantrikdb")
+    }
+
+    /// Extract the four bundled files into [`extraction_dir`] and load.
+    /// Errors are returned as owned strings so the OnceLock's stored
+    /// value is `'static` (no borrows escape the closure).
     fn init_model() -> Result<StaticModel, String> {
         use std::io::Write;
-        // Per-process unique temp dir so concurrent yantrikdb processes
-        // on the same host don't race on file writes.
-        let temp = std::env::temp_dir()
-            .join("yantrikdb")
-            .join(format!("potion-2M-{}", std::process::id()));
+        let temp = extraction_dir();
         std::fs::create_dir_all(&temp)
             .map_err(|e| format!("create temp dir {}: {e}", temp.display()))?;
 
@@ -151,12 +190,16 @@ mod once_cell_lite {
             ("modules.json", super::POTION_2M_MODULES),
         ] {
             let path = temp.join(name);
-            // Skip only when the file is already complete. Unlike the
-            // previous version this is not the concurrency guard — the
-            // process-global OnceLock is (see MODEL) — it just avoids
-            // rewriting ~8MB on a re-init.
-            if matches!(std::fs::metadata(&path), Ok(m) if m.len() == bytes.len() as u64) {
-                continue;
+            // Reuse only when the on-disk copy is byte-identical to the
+            // baked-in one. A length-only check would accept a
+            // same-length corruption, and the directory is now shared
+            // across processes — a stale or damaged file from an earlier
+            // run must not be trusted on length alone. Reading ~8MB once
+            // per process is the cheap side of that trade.
+            if let Ok(existing) = std::fs::read(&path) {
+                if existing == bytes {
+                    continue;
+                }
             }
             // WRITE-THEN-RENAME, never write in place. `File::create`
             // truncates, so writing directly to `path` publishes an
@@ -169,6 +212,10 @@ mod once_cell_lite {
             // Defense in depth: the OnceLock already serializes this
             // today, but the failure mode is silent corruption and the
             // cost of not relying on that is one rename.
+            // The staging name keeps the PID: the directory is shared
+            // by every process on the host now, so concurrent writers
+            // must not collide on the partial file. Only the directory
+            // lost its PID.
             let staging = temp.join(format!("{name}.{}.partial", std::process::id()));
             {
                 let mut f = std::fs::File::create(&staging)
@@ -184,6 +231,41 @@ mod once_cell_lite {
 
         StaticModel::from_pretrained(&temp, None, None, None)
             .map_err(|e| format!("model2vec_rs load: {e}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// Regression: the extraction directory used to be
+        /// `potion-2M-<pid>`, created once per process and never removed,
+        /// so a host whose `TMPDIR` is persistent accumulated one full
+        /// copy of the model per process start. It must be stable across
+        /// processes now — keyed on the bundle's content, not the PID.
+        #[test]
+        fn extraction_dir_is_stable_not_pid_keyed() {
+            let dir = super::extraction_dir();
+            let s = dir.to_string_lossy().into_owned();
+            assert!(
+                !s.contains(&std::process::id().to_string()),
+                "extraction dir must not be keyed on the process id: {s}"
+            );
+            assert!(
+                s.contains(super::super::BUNDLED_EMBEDDER_NAME),
+                "extraction dir should be keyed on the model identity: {s}"
+            );
+            // With `dirs` compiled in, the bundled model caches under the
+            // platform cache dir — the same scheme the downloaded
+            // embedders use.
+            #[cfg(feature = "embedder-download")]
+            if let Some(cache) = dirs::cache_dir() {
+                assert!(
+                    dir.starts_with(cache.join("yantrikdb").join("models")),
+                    "bundled model should cache under the platform cache dir: {s}"
+                );
+            }
+            // Stable: two calls agree, so a second process lands in the
+            // same directory.
+            assert_eq!(dir, super::extraction_dir());
+        }
     }
 }
 
