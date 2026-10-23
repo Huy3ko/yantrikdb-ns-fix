@@ -42,6 +42,30 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     dot / (norm_a * norm_b)
 }
 
+/// A compression gist (`pre_compression=true`) must never be chosen as a
+/// cluster's seed.
+///
+/// `on_pre_compress` writes a mixed-topic summary at `importance=0.75` — above
+/// the ordinary baseline. Its entity set is the union of everything it
+/// summarises, so it is embedding-close to almost every record in its
+/// namespace and is never disjoint from any one topic it absorbed (the
+/// entity-overlap guard above therefore cannot fire for it). As a SEED it
+/// gathers unrelated records into one cluster, and because it also carries the
+/// highest importance the consolidated record takes the gist's text as its
+/// lead — the "consolidation magnet" in issue #253.
+///
+/// As a MEMBER it is ordinary: a gist that is not the earliest record still
+/// joins the cluster a real record seeds. Only seed selection is filtered.
+///
+/// Keyed on the existing metadata tag, the same way `consolidated_from` is
+/// filtered in [`find_consolidation_candidates_page`] — no schema change.
+pub(crate) fn compression_gist_cannot_seed(m: &MemoryWithEmbedding) -> bool {
+    m.metadata
+        .get("pre_compression")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Find clusters of related memories using greedy agglomerative approach.
 ///
 /// Two memories can cluster together if:
@@ -53,6 +77,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 ///     (e.g., "Alice is CEO" vs "Sarah is CTO" — same shape, different people).
 ///     When either memory has no entities the guard falls back to cosine-only
 ///     (no regression on memories predating entity extraction).
+///   - A record may be ineligible to SEED a cluster while remaining eligible
+///     to be a MEMBER of one. `seed_excluded` (when supplied) is consulted
+///     only when a record is about to seed; it is never applied to the
+///     candidate scan. See [`compression_gist_cannot_seed`] for the case that
+///     motivates the distinction.
 pub fn find_clusters(
     memories: &[MemoryWithEmbedding],
     entities_by_rid: Option<&HashMap<String, HashSet<String>>>,
@@ -60,6 +89,7 @@ pub fn find_clusters(
     time_window_days: f64,
     min_cluster_size: usize,
     max_cluster_size: usize,
+    seed_excluded: Option<&dyn Fn(&MemoryWithEmbedding) -> bool>,
 ) -> Vec<Vec<usize>> {
     if memories.len() < min_cluster_size {
         return vec![];
@@ -74,6 +104,12 @@ pub fn find_clusters(
 
     for (seed_pos, &i) in indices.iter().enumerate() {
         if used.contains(&i) {
+            continue;
+        }
+
+        // Seed selection only. A record rejected here is NOT marked used, so it
+        // stays eligible as a member of a cluster some other record seeds.
+        if seed_excluded.is_some_and(|pred| pred(&memories[i])) {
             continue;
         }
 
@@ -778,6 +814,8 @@ fn find_consolidation_candidates_page(
             time_window_days,
             min_cluster_size,
             10,
+            // A compression gist must never be the cluster's seed (issue #253).
+            Some(&compression_gist_cannot_seed),
         );
         for indices in cluster_indices {
             result.push(
@@ -1273,7 +1311,7 @@ mod tests {
                 namespace: "default".to_string(),
             })
             .collect();
-        let clusters = find_clusters(&mems, None, 0.9, f64::MAX, 2, 100);
+        let clusters = find_clusters(&mems, None, 0.9, f64::MAX, 2, 100, None);
         // All five are mutually similar and within the window → ONE cluster
         // of all five. The bug produced five singletons (returned as none,
         // since min_cluster_size=2).
@@ -1322,6 +1360,133 @@ mod tests {
         }
     }
 
+    fn make_mem_with_meta(
+        rid: &str,
+        text: &str,
+        embedding: Vec<f32>,
+        created_at: f64,
+        importance: f64,
+        metadata: serde_json::Value,
+    ) -> MemoryWithEmbedding {
+        MemoryWithEmbedding {
+            metadata,
+            ..make_mem(rid, text, embedding, created_at, importance)
+        }
+    }
+
+    /// Issue #253. A compression gist (`pre_compression=true`) is written at
+    /// `importance=0.75` and is a union of everything it summarises, so it is
+    /// embedding-close to almost every record in its namespace. When it is the
+    /// EARLIEST record in the window it becomes the cluster seed and absorbs
+    /// unrelated records — and because it also holds the highest importance, the
+    /// consolidated record takes the gist's text as its lead.
+    ///
+    /// The gist must stay eligible as a cluster MEMBER but must never be the
+    /// SEED. This test fails without `seed_excluded`.
+    #[test]
+    fn test_find_clusters_pre_compression_gist_is_never_the_seed() {
+        let now = 1_000_000.0;
+        // The magnet: earliest, highest importance, similar to both facts.
+        let gist = make_mem_with_meta(
+            "gist",
+            "[compression-summary, 50 turns] intent: ...",
+            vec![1.0, 0.0, 0.0, 0.0],
+            now,
+            0.75,
+            serde_json::json!({"pre_compression": true, "source": "compression_summary"}),
+        );
+        // Two records on unrelated topics that are similar to each other (so
+        // they legitimately cluster) and, like everything else, to the gist.
+        let fact1 = make_mem(
+            "fact1",
+            "Bitwarden BSM details",
+            vec![0.95, 0.05, 0.0, 0.0],
+            now + 100.0,
+            0.6,
+        );
+        let fact2 = make_mem(
+            "fact2",
+            "DPI community tools",
+            vec![0.90, 0.10, 0.0, 0.0],
+            now + 200.0,
+            0.6,
+        );
+        let mems = vec![gist, fact1, fact2];
+
+        // Baseline: the magnet reproduces. The gist seeds and absorbs both.
+        let today = find_clusters(&mems, None, 0.9, 7.0, 2, 10, None);
+        assert_eq!(today.len(), 1, "baseline: the magnet must reproduce");
+        assert_eq!(
+            today[0][0], 0,
+            "baseline: the gist is the seed (cluster[0] is always the seed)"
+        );
+
+        // With the exclusion: the facts still cluster, the gist does not seed.
+        let fixed = find_clusters(
+            &mems,
+            None,
+            0.9,
+            7.0,
+            2,
+            10,
+            Some(&compression_gist_cannot_seed),
+        );
+        assert_eq!(fixed.len(), 1, "the two facts still cluster on their own");
+        assert_eq!(
+            fixed[0],
+            vec![1, 2],
+            "facts cluster together, gist is not the seed"
+        );
+    }
+
+    /// The exclusion is SEED-ONLY. A gist that is not the earliest record must
+    /// still be able to join the cluster a real record seeds — a full filter
+    /// (excluding gists from the candidate scan as well) would fail here.
+    #[test]
+    fn test_find_clusters_pre_compression_gist_can_still_be_a_member() {
+        let now = 1_000_000.0;
+        let fact1 = make_mem(
+            "fact1",
+            "Bitwarden BSM details",
+            vec![0.95, 0.05, 0.0, 0.0],
+            now,
+            0.6,
+        );
+        let fact2 = make_mem(
+            "fact2",
+            "DPI community tools",
+            vec![0.90, 0.10, 0.0, 0.0],
+            now + 100.0,
+            0.6,
+        );
+        // The gist is the NEWEST record here, so it is a candidate member.
+        let gist = make_mem_with_meta(
+            "gist",
+            "[compression-summary, 50 turns] intent: ...",
+            vec![1.0, 0.0, 0.0, 0.0],
+            now + 200.0,
+            0.75,
+            serde_json::json!({"pre_compression": true}),
+        );
+        let mems = vec![fact1, fact2, gist];
+
+        let clusters = find_clusters(
+            &mems,
+            None,
+            0.9,
+            7.0,
+            2,
+            10,
+            Some(&compression_gist_cannot_seed),
+        );
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0][0], 0, "a real record still seeds");
+        assert!(
+            clusters[0].contains(&2),
+            "the gist remains eligible as a member: {clusters:?}"
+        );
+    }
+
     fn vec_seed(seed: f32, dim: usize) -> Vec<f32> {
         let raw: Vec<f32> = (0..dim)
             .map(|i| (seed * (i as f32 + 1.0) * 1.7).sin() + (seed * (i as f32 + 2.0) * 0.3).cos())
@@ -1353,7 +1518,7 @@ mod tests {
             make_mem("c", "t3", vec_seed(10.0, 8), now + 200.0, 0.5),
         ];
 
-        let clusters = find_clusters(&mems, None, 0.9, 7.0, 2, 10);
+        let clusters = find_clusters(&mems, None, 0.9, 7.0, 2, 10, None);
         assert_eq!(clusters.len(), 1);
         assert!(clusters[0].contains(&0)); // "a"
         assert!(clusters[0].contains(&1)); // "b"
@@ -1379,11 +1544,11 @@ mod tests {
         );
 
         // Without guard: would cluster (high cosine).
-        let unguarded = find_clusters(&mems, None, 0.9, 7.0, 2, 10);
+        let unguarded = find_clusters(&mems, None, 0.9, 7.0, 2, 10, None);
         assert_eq!(unguarded.len(), 1, "cosine-only should merge");
 
         // With guard: should NOT cluster (disjoint entities).
-        let guarded = find_clusters(&mems, Some(&entities), 0.9, 7.0, 2, 10);
+        let guarded = find_clusters(&mems, Some(&entities), 0.9, 7.0, 2, 10, None);
         assert_eq!(guarded.len(), 0, "entity-overlap guard should block merge");
     }
 
@@ -1410,7 +1575,7 @@ mod tests {
             ["Alice", "Acme"].iter().map(|s| s.to_string()).collect(),
         );
 
-        let guarded = find_clusters(&mems, Some(&entities), 0.9, 7.0, 2, 10);
+        let guarded = find_clusters(&mems, Some(&entities), 0.9, 7.0, 2, 10, None);
         assert_eq!(guarded.len(), 1, "shared entity should allow merge");
     }
 
@@ -1424,7 +1589,7 @@ mod tests {
             make_mem("b", "t2", vec_seed(1.05, 8), now + 100.0, 0.5),
         ];
         let entities: HashMap<String, HashSet<String>> = HashMap::new();
-        let clusters = find_clusters(&mems, Some(&entities), 0.9, 7.0, 2, 10);
+        let clusters = find_clusters(&mems, Some(&entities), 0.9, 7.0, 2, 10, None);
         assert_eq!(
             clusters.len(),
             1,
