@@ -49,6 +49,11 @@ pub fn py_find_clusters(
         time_window_days,
         min_cluster_size,
         max_cluster_size,
+        // No seed exclusion: a Python caller cannot supply a predicate across
+        // the FFI, and this binding is a raw utility. The engine paths the
+        // plugin actually consolidates through (`consolidate`,
+        // `find_consolidation_candidates`) apply the gist exclusion in Rust.
+        None,
     );
 
     // Convert back: each cluster is a list of the original dicts

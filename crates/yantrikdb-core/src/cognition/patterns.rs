@@ -6,7 +6,7 @@
 
 use rusqlite::params;
 
-use crate::consolidate::find_clusters;
+use crate::consolidate::{compression_gist_cannot_seed, find_clusters};
 use crate::engine::YantrikDB;
 use crate::error::Result;
 use crate::serde_helpers::deserialize_f32;
@@ -331,6 +331,10 @@ fn mine_topic_clusters(db: &YantrikDB, config: &PatternConfig) -> Result<Vec<Raw
         config.topic_cluster_time_window_days,
         5,  // min cluster size for a "recurring topic"
         20, // max cluster size
+        // Same bug class as consolidation (issue #253): a compression gist
+        // seeding a topic cluster would mint a "recurring topic" whose text is
+        // a summary of everything nearby.
+        Some(&compression_gist_cannot_seed),
     );
 
     let mut patterns = Vec::new();
